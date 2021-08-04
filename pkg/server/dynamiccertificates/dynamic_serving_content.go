@@ -23,6 +23,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
+
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/util/workqueue"
@@ -133,15 +135,52 @@ func (c *DynamicCertKeyPairContent) Run(workers int, stopCh <-chan struct{}) {
 	// doesn't matter what workers say, only start one.
 	go wait.Until(c.runWorker, time.Second, stopCh)
 
-	// start timer that rechecks every minute, just in case.  this also serves to prime the controller quickly.
-	go wait.PollImmediateUntil(FileRefreshDuration, func() (bool, error) {
-		c.queue.Add(workItemKey)
-		return false, nil
-	}, stopCh)
-
-	// TODO this can be wired to an fsnotifier as well.
+	// start the loop that watches the cert and key files until stopCh is closed.
+	go wait.Until(func() {
+		if err := c.watchCertKeyFile(stopCh); err != nil {
+			klog.ErrorS(err, "Failed to watch cert and key file, will retry later")
+		}
+	}, time.Minute, stopCh)
 
 	<-stopCh
+}
+
+func (c *DynamicCertKeyPairContent) watchCertKeyFile(stopCh <-chan struct{}) error {
+	w, err := fsnotify.NewWatcher()
+	if err != nil {
+		return fmt.Errorf("error creating fsnotify watcher: %v", err)
+	}
+	defer w.Close()
+
+	if err = w.Add(c.certFile); err != nil {
+		return fmt.Errorf("error adding watch for file %s: %v", c.certFile, err)
+	}
+	if err = w.Add(c.keyFile); err != nil {
+		return fmt.Errorf("error adding watch for file %s: %v", c.keyFile, err)
+	}
+	// Reload the content when it starts a new watch as the file may have changed.
+	c.queue.Add(workItemKey)
+
+	for {
+		select {
+		case e := <-w.Events:
+			c.queue.Add(workItemKey)
+			// The original watched file is removed or renamed, restarting a new watch.
+			if e.Op&(fsnotify.Remove|e.Op&fsnotify.Rename) > 0 {
+				if err := w.Remove(e.Name); err != nil {
+					klog.InfoS("Failed to remove file watch, it may have been deleted", "file", e.Name, "err", err)
+				}
+				if err := w.Add(e.Name); err != nil {
+					return fmt.Errorf("error adding watch for file %s: %v", e.Name, err)
+				}
+				c.queue.Add(workItemKey)
+			}
+		case err := <-w.Errors:
+			return fmt.Errorf("received fsnotify error: %v", err)
+		case <-stopCh:
+			return nil
+		}
+	}
 }
 
 func (c *DynamicCertKeyPairContent) runWorker() {
